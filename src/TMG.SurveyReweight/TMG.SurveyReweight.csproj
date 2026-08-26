@@ -1,0 +1,28 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>TMG.SurveyReweight</RootNamespace>
+    <Authors>Travel Modelling Group</Authors>
+    <Company>University of Toronto</Company>
+    <Description>A set of modules for XTMF2 to Reweight surveys.</Description>
+        <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <AppendRuntimeIdentifierToOutputPath>false</AppendRuntimeIdentifierToOutputPath>
+    <OutputPath>..\..\..\XTMF2-Dev\Modules\</OutputPath>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\..\XTMF2\src\XTMF2.Interfaces\XTMF2.Interfaces.csproj" />
+    <ProjectReference Include="..\..\..\XTMF2\src\XTMF2\XTMF2.csproj" />
+    <ProjectReference Include="..\..\..\TMG-Framework\src\TMG-Framework\TMG-Framework.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleTo">
+      <_Parameter1>TMG.SurveyReweight.Tests</_Parameter1>
+    </AssemblyAttribute>
+  </ItemGroup>
+
+</Project>

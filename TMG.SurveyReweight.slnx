@@ -1,0 +1,6 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/TMG.SurveyReweight/TMG.SurveyReweight.csproj" />
+  </Folder>
+  <Folder Name="/test/" />
+</Solution>
