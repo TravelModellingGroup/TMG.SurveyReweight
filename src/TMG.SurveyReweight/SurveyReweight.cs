@@ -1,4 +1,5 @@
 using XTMF2.RuntimeModules;
+using System.Collections.Concurrent;
 
 namespace TMG.SurveyReweight;
 
@@ -98,10 +99,8 @@ public class SurveyReweight : BaseAction
             log?.Invoke($"Running iteration {iteration + 1} of {maxIterations}...");
             bool allConstraintsSatisfied = true;
 
-            // TODO: Switch this to all run in parallel later.
             Parallel.Invoke(() =>
             {
-                //for (int i = 0; i < constraints.HouseholdConstraints.Length; i++)
                 Parallel.For(0, constraints.HouseholdConstraints.Length, i =>
                 {
                     var data = constraintData[i];
@@ -110,17 +109,11 @@ public class SurveyReweight : BaseAction
                      currentExpansionFactors, data.Scratch, data.ExpansionIndex, data.GeographyIndex, data.LogRatios))
                     {
                         allConstraintsSatisfied = false;
-                        if(iteration >= 300)
-                        {
-                            Console.WriteLine();
-                        }
                     }
                 });
             },
             () =>
             {
-
-                //for (int i = 0; i < constraints.PersonConstraints.Length; i++)
                 Parallel.For(0, constraints.PersonConstraints.Length, i =>
                 {
                     var data = constraintData[householdCount + i];
@@ -134,8 +127,6 @@ public class SurveyReweight : BaseAction
             },
             () =>
             {
-
-                //for (int i = 0; i < constraints.TripConstraints.Length; i++)
                 Parallel.For(0, constraints.TripConstraints.Length, i =>
                 {
                     var data = constraintData[householdCount + personCount + i];
@@ -158,27 +149,29 @@ public class SurveyReweight : BaseAction
             // The correction for each household is the damped geometric mean of the per-constraint ratios:
             //   W_hh *= exp(damping * sum(ln(ratio_i)) / count)
             // where ratio_i is the correction the i-th constraint wants applied to that household (zero means the constraint does not affect it).
-            for (nuint h = 0; h < surveyRecords.NumberOfHouseholds; h++)
+            var householdCountForUpdate = currentExpansionFactors.Length;
+            var householdChunkSize = Math.Max(1024, householdCountForUpdate / (Environment.ProcessorCount * 4));
+            Parallel.ForEach(Partitioner.Create(0, householdCountForUpdate, householdChunkSize), range =>
             {
-                float totalLog = 0f;
-                int count = 0;
-
-                for (int i = 0; i < constraintData.Length; i++)
+                for (var h = range.Item1; h < range.Item2; h++)
                 {
-                    var logRatio = constraintData[i].LogRatios[h];
-                    if (logRatio == 0.0f)
+                    float totalLog = 0f;
+                    int count = 0;
+
+                    for (int i = 0; i < constraintData.Length; i++)
                     {
-                        continue;
+                        ref var logRatiosReference = ref MemoryMarshal.GetArrayDataReference(constraintData[i].LogRatios);
+                        var logRatio = Unsafe.Add(ref logRatiosReference, h);
+                        totalLog += logRatio;
+                        count += BoolToInt(logRatio != 0.0f);
                     }
-                    totalLog += logRatio;
-                    count++;
-                }
 
-                if (count > 0)
-                {
-                    currentExpansionFactors[h] *= MathF.Exp(damping * totalLog / count);
+                    if (count > 0)
+                    {
+                        currentExpansionFactors[h] *= MathF.Exp(damping * totalLog / count);
+                    }
                 }
-            }
+            });
         }
         log?.Invoke($"Reweighting process completed in {Math.Min(iteration + 1, maxIterations)} iterations of {maxIterations}.");
 
@@ -199,6 +192,15 @@ public class SurveyReweight : BaseAction
         }
 
         log?.Invoke($"Finished Reweighting");
+    }
+
+    /// <summary>
+    /// Converts a boolean value to an integer (1 for true, 0 for false).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
+    private static int BoolToInt(bool condition)
+    {
+        return (int)Unsafe.As<bool, byte>(ref condition);
     }
 
     private void WriteConstraintReport(
@@ -257,7 +259,7 @@ public class SurveyReweight : BaseAction
         float actual)
     {
         var difference = actual - target;
-        var ratio = target == 0.0f ? 0.0f : actual / target;
+        var ratio = target == 0.0f ? 1.0f : actual / target;
         writer.WriteLine($"{CsvEscape(constraintType)},{CsvEscape(constraintName)},{CsvEscape(geography.Exists ? ((long)(nint)geography).ToString() : "Global")},{target},{actual},{difference},{ratio}");
     }
 

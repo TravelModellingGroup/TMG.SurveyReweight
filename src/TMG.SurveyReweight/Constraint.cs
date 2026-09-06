@@ -1,5 +1,8 @@
 namespace TMG.SurveyReweight;
 
+using System.Collections.Concurrent;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using TMG.Utilities;
 
 [Module(
@@ -145,9 +148,18 @@ public class LoadConstraints : BaseFunction<(ZoneSystem ZoneSystem, SurveyRecord
     {
         var zoneSystem = context.ZoneSystem;
         var surveyRecords = context.SurveyRecords;
-        var household = HouseholdConstraints.Select(f => f.Invoke((zoneSystem, surveyRecords.HouseholdAttributes))).ToArray();
-        var person = PersonConstraints.Select(f => f.Invoke((zoneSystem, surveyRecords.PersonAttributes))).ToArray();
-        var trip = TripConstraints.Select(f => f.Invoke((zoneSystem, surveyRecords.TripAttributes))).ToArray();
+        var household = new Constraint[HouseholdConstraints.Length];
+        var person = new Constraint[PersonConstraints.Length];
+        var trip = new Constraint[TripConstraints.Length];
+
+        Parallel.Invoke(
+            () => Parallel.For(0, HouseholdConstraints.Length, i =>
+                household[i] = HouseholdConstraints[i].Invoke((zoneSystem, surveyRecords.HouseholdAttributes))),
+            () => Parallel.For(0, PersonConstraints.Length, i =>
+                person[i] = PersonConstraints[i].Invoke((zoneSystem, surveyRecords.PersonAttributes))),
+            () => Parallel.For(0, TripConstraints.Length, i =>
+                trip[i] = TripConstraints[i].Invoke((zoneSystem, surveyRecords.TripAttributes))));
+
         return new Constraints
         {
             HouseholdConstraints = household,
@@ -168,7 +180,8 @@ public class LoadConstraints : BaseFunction<(ZoneSystem ZoneSystem, SurveyRecord
 public record Constraint(IModule Module, string Name, CategoryMap? CategoryMap, RecordAttribute[] MatchingAttributes, float[] Targets, float Tolerance)
 {
 
-    nuint[] _matchedIndexes = MatchingAttributes.Select(a => (nuint)a.Index).ToArray();
+    nuint[] _matchedIndexes = [.. MatchingAttributes.Select(a => (nuint)a.Index)];
+    float[]? _matchedValues;
 
     internal float[] Aggregate(float[] data, int numberOfAttributes, float[] currentExpansionFactors, nuint[] expIndexes, nuint[] geographyIndex)
     {
@@ -200,26 +213,45 @@ public record Constraint(IModule Module, string Name, CategoryMap? CategoryMap, 
          float[] scratch, nuint[] expIndexes, nuint[] geographyIndex, float[] logRatios)
     {
         
-        scratch.AsSpan().Clear();
-        logRatios.AsSpan().Clear();
-        
         var numberOfRecords = (nuint)(data.Length / (int)numberOfAttributes);
 
+        // Precache the matched values for each record to avoid recalculating them multiple times.
+        var matchedValues = _matchedValues;
+        if (matchedValues is null)
+        {
+            // We should only need to clear these on our first run, values that get set will be overwritten, and values that don't will be zeroed out
+            // from this first iteration.
+            scratch.AsSpan().Clear();
+            logRatios.AsSpan().Clear();
+            matchedValues = new float[(int)numberOfRecords];
+            Parallel.For(0, (int)numberOfRecords, i =>
+            {
+                var matchedValue = 1.0f;
+                for (nuint j = 0; j < (nuint)_matchedIndexes.Length; j++)
+                {
+                    matchedValue *= data[(nuint)i * numberOfAttributes + _matchedIndexes[j]];
+                }
+                matchedValues[i] = matchedValue;
+            });
+            _matchedValues = matchedValues;
+        }
+
         // Step 1 aggregate the current expansion factors to the
+        ref var currentExpansionFactorsReference = ref MemoryMarshal.GetArrayDataReference(currentExpansionFactors);
+        ref var matchedValuesReference = ref MemoryMarshal.GetArrayDataReference(matchedValues);
+        ref var scratchReference = ref MemoryMarshal.GetArrayDataReference(scratch);
+        ref var expIndexesReference = ref MemoryMarshal.GetArrayDataReference(expIndexes);
+        ref var geographyIndexReference = ref MemoryMarshal.GetArrayDataReference(geographyIndex);
         for (nuint i = 0; i < numberOfRecords; i++)
         {
             // Match the records geography to the constraint's geography
-            var recordExp = currentExpansionFactors[expIndexes[i]];
+            var expansionIndex = Unsafe.Add(ref expIndexesReference, (nint)i);
+            var geographyIndexValue = Unsafe.Add(ref geographyIndexReference, (nint)i);
+            var recordExp = Unsafe.Add(ref currentExpansionFactorsReference, (nint)expansionIndex) *
+                Unsafe.Add(ref matchedValuesReference, (nint)i);
 
-            // Go through all of the attributes and multiply them together to get the total expansion factor for this record.
-            // TODO: In the future it might make sense to compute if a record matches or if it doesn't a single time to improve performance.
-            for (nuint j = 0; j < (nuint)MatchingAttributes.Length; j++)
-            {
-                var attributeValue = data[i * numberOfAttributes + _matchedIndexes[j]];
-                recordExp *= attributeValue;
-            }
-
-            scratch[geographyIndex[i]] += recordExp;
+            ref var scratchValue = ref Unsafe.Add(ref scratchReference, (nint)geographyIndexValue);
+            scratchValue += recordExp;
         }
 
         // Step 2 compare the results to the targets and compute how we need to reweight the expansion factors to meet the targets.
@@ -253,27 +285,24 @@ public record Constraint(IModule Module, string Name, CategoryMap? CategoryMap, 
                 // If the ratio is not within the tolerance, the constraint is not satisfied.
                 withinTolerance = false;
             }
+            scratch[i] = MathF.Log(ratio);
         }
 
         // Step 3 write the logarithm of the correction ratio to every matched household.
         // Expansion factors are households, so all levels (household, person, trip) address the same array.
-        for (nuint i = 0; i < numberOfRecords; i++)
+        var recordCount = (int)numberOfRecords;
+        var chunkSize = Math.Max(1024, recordCount / (Environment.ProcessorCount * 4));
+        Parallel.ForEach(Partitioner.Create(0, recordCount, chunkSize), range =>
         {
-            var matches = true;
-            for (nuint j = 0; j < (nuint)_matchedIndexes.Length; j++)
+            for (var i = range.Item1; i < range.Item2; i++)
             {
-                if (data[i * numberOfAttributes + _matchedIndexes[j]] <= 0)
+                if (matchedValues[i] > 0)
                 {
-                    matches = false;
-                    break;
+                    // At this point scratch contains the logarithm of the correction ratio for each geography.
+                    logRatios[expIndexes[i]] = scratch[geographyIndex[i]];
                 }
             }
-
-            if (matches)
-            {
-                logRatios[expIndexes[i]] = MathF.Log(scratch[geographyIndex[i]]);
-            }
-        }
+        });
 
         return withinTolerance;
     }
