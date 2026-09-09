@@ -25,13 +25,19 @@ public class SurveyReweight : BaseAction
     [Parameter(Name = "Damping", DefaultValue = "1.0", Description = "The damping applied to the combined constraint corrections. A value of one fully applies the corrections.", Index = 4)]
     public IFunction<float> Damping = null!;
 
-    [SubModule(Required = true, Name = "UpdatedExpansionFactorsFile", Description = "The CSV file to write the updated expansion factors to.", Index = 5)]
+    [Parameter(Name = "MinimumExpansionFactor", DefaultValue = "1.0", Description = "The minimum allowed expansion factor during the reweighting process.", Index = 5)]
+    public IFunction<float> MinimumExpansionFactor = null!;
+
+    [Parameter(Name = "MaximumExpansionFactor", DefaultValue = "50.0", Description = "The maximum allowed expansion factor during the reweighting process.", Index = 6)]
+    public IFunction<float> MaximumExpansionFactor = null!;
+
+    [SubModule(Required = true, Name = "UpdatedExpansionFactorsFile", Description = "The CSV file to write the updated expansion factors to.", Index = 7)]
     public IFunction<WriteStream> UpdatedExpansionFactorsFile = null!;
 
-    [SubModule(Required = false, Name = "Log", Description = "The log for the reweighting process.", Index = 6)]
+    [SubModule(Required = false, Name = "Log", Description = "The log for the reweighting process.", Index = 8)]
     public IFunction<Log>? Log;
 
-    [SubModule(Required = false, Name = "ConstraintReportFile", Description = "The optional CSV file to write the final constraint report to.", Index = 7)]
+    [SubModule(Required = false, Name = "ConstraintReportFile", Description = "The optional CSV file to write the final constraint report to.", Index = 9)]
     public IFunction<WriteStream>? ConstraintReportFile;
 
     public override void Invoke()
@@ -153,6 +159,8 @@ public class SurveyReweight : BaseAction
             var householdChunkSize = Math.Max(1024, householdCountForUpdate / (Environment.ProcessorCount * 4));
             Parallel.ForEach(Partitioner.Create(0, householdCountForUpdate, householdChunkSize), range =>
             {
+                var minExpansionFactor = MinimumExpansionFactor.Invoke();
+                var maxExpansionFactor = MaximumExpansionFactor.Invoke();
                 for (var h = range.Item1; h < range.Item2; h++)
                 {
                     float totalLog = 0f;
@@ -169,6 +177,7 @@ public class SurveyReweight : BaseAction
                     if (count > 0)
                     {
                         currentExpansionFactors[h] *= MathF.Exp(damping * totalLog / count);
+                        currentExpansionFactors[h] = MathF.Max(minExpansionFactor, MathF.Min(maxExpansionFactor, currentExpansionFactors[h]));
                     }
                 }
             });
