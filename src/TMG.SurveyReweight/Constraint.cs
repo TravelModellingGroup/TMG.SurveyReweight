@@ -1,8 +1,5 @@
 namespace TMG.SurveyReweight;
 
-using System.Collections.Concurrent;
-using System.Runtime.CompilerServices;
-using System.Runtime.InteropServices;
 using TMG.Utilities;
 
 [Module(
@@ -33,6 +30,9 @@ public class LoadConstraint : BaseFunction<(ZoneSystem ZoneSystem, RecordAttribu
     [SubModule(Required = false, Name = "Constraint Name", Description = "The name of the constraint.", Index = 6)]
     public IFunction<string>? ConstraintName = null;
 
+    [Parameter(DefaultValue = "1.0", Name = "ConstraintWeight", Index = 7, Description = "The relative weight of this constraint in the calibration objective. Set to zero to exclude it from optimization.")]
+    public IFunction<float> ConstraintWeight = null!;
+
     private RecordAttribute[] GetMatchingAttributes(string constraintName, RecordAttribute[] availableAttributes)
     {
         var matchingAttributes = new RecordAttribute[MatchingAttributes.Length];
@@ -58,10 +58,15 @@ public class LoadConstraint : BaseFunction<(ZoneSystem ZoneSystem, RecordAttribu
         var matchingAttributes = GetMatchingAttributes(constraintName, context.AvailableAttributes);
         var geographyColumn = GeographyColumn.Invoke();
         var targetColumn = TargetColumn.Invoke();
+        var constraintWeight = ConstraintWeight.Invoke();
 
         if (geographyColumn < 0 || targetColumn < 0)
         {
             throw new XTMFRuntimeException(this, "CSV column indexes must be greater than or equal to zero.");
+        }
+        if (!float.IsFinite(constraintWeight) || constraintWeight < 0.0f)
+        {
+            throw new XTMFRuntimeException(this, "ConstraintWeight must be finite and greater than or equal to zero.");
         }
         if (geographyColumn == targetColumn)
         {
@@ -124,7 +129,7 @@ public class LoadConstraint : BaseFunction<(ZoneSystem ZoneSystem, RecordAttribu
             throw new XTMFRuntimeException(this, $"Unable to read from {reader.FileName} on line {reader.LineNumber}: {exception.Message}");
         }
 
-        return new Constraint(this, constraintName, categoryMap, matchingAttributes, targets, Tolerance.Invoke());
+        return new Constraint(this, constraintName, categoryMap, matchingAttributes, targets, Tolerance.Invoke(), constraintWeight);
     }
 }
 
@@ -177,7 +182,15 @@ public class LoadConstraints : BaseFunction<(ZoneSystem ZoneSystem, SurveyRecord
 /// <param name="CategoryMap">The aggregation of geography to use, leave null for TAZ.</param>
 /// <param name="MatchingAttributes">The survey record attributes to bind to.</param>
 /// <param name="Targets">The target values for the constraint.</param>
-public record Constraint(IModule Module, string Name, CategoryMap? CategoryMap, RecordAttribute[] MatchingAttributes, float[] Targets, float Tolerance)
+/// <param name="Weight">The relative contribution of the constraint to the calibration objective.</param>
+public record Constraint(
+    IModule Module,
+    string Name,
+    CategoryMap? CategoryMap,
+    RecordAttribute[] MatchingAttributes,
+    float[] Targets,
+    float Tolerance,
+    float Weight = 1.0f)
 {
 
     nuint[] _matchedIndexes = [.. MatchingAttributes.Select(a => (nuint)a.Index)];
@@ -186,7 +199,7 @@ public record Constraint(IModule Module, string Name, CategoryMap? CategoryMap, 
     internal float[] Aggregate(float[] data, int numberOfAttributes, float[] currentExpansionFactors, nuint[] expIndexes, nuint[] geographyIndex)
     {
         var actuals = new float[Targets.Length];
-        var numberOfRecords = data.Length / numberOfAttributes;
+        var numberOfRecords = expIndexes.Length;
         for (int i = 0; i < numberOfRecords; i++)
         {
             var recordTotal = currentExpansionFactors[expIndexes[i]];
@@ -199,32 +212,29 @@ public record Constraint(IModule Module, string Name, CategoryMap? CategoryMap, 
         return actuals;
     }
 
-    /// <summary>
-    /// Update the constraint using the current expansion factors and provide a new set of expansion factors.
-    /// </summary>
-    /// <param name="data">The data of the current level</param>
-    /// <param name="currentExpansionFactors">The current expansion factors (does not write to this)</param>
-    /// <param name="scratch">Temporary scratch space for calculations</param>
-    /// <param name="expIndexes">The household index of each record (also used for addressing the logRatios).</param>
-    /// <param name="geographyIndex">The geography index for each record (used for matching to the constraint's Target geography)</param>
-    /// <param name="logRatios">The natural log of the correction ratio per household. A value of zero indicates no correction is needed.</param>
-    /// <returns>True if the constraint is satisfied, otherwise false</returns>
-    internal bool UpdateConstraint(float[] data, nuint numberOfAttributes, float[] currentExpansionFactors,
-         float[] scratch, nuint[] expIndexes, nuint[] geographyIndex, float[] logRatios)
+    internal bool AccumulateObjectiveAndGradient(
+        float[] data,
+        nuint numberOfAttributes,
+        float[] expansionFactors,
+        nuint[] expIndexes,
+        nuint[] geographyIndex,
+        double[] actuals,
+        double[]? residualGradient,
+        double[]? householdGradient,
+        int totalConstraintCells,
+        out double objective)
     {
-        
-        var numberOfRecords = (nuint)(data.Length / (int)numberOfAttributes);
+        var numberOfRecords = expIndexes.Length;
+        if (!float.IsFinite(Weight) || Weight < 0.0f)
+        {
+            throw new XTMFRuntimeException(Module, $"Constraint {Name} has a weight that is not finite and nonnegative.");
+        }
 
-        // Precache the matched values for each record to avoid recalculating them multiple times.
         var matchedValues = _matchedValues;
         if (matchedValues is null)
         {
-            // We should only need to clear these on our first run, values that get set will be overwritten, and values that don't will be zeroed out
-            // from this first iteration.
-            scratch.AsSpan().Clear();
-            logRatios.AsSpan().Clear();
-            matchedValues = new float[(int)numberOfRecords];
-            Parallel.For(0, (int)numberOfRecords, i =>
+            matchedValues = new float[numberOfRecords];
+            Parallel.For(0, numberOfRecords, i =>
             {
                 var matchedValue = 1.0f;
                 for (nuint j = 0; j < (nuint)_matchedIndexes.Length; j++)
@@ -236,75 +246,76 @@ public record Constraint(IModule Module, string Name, CategoryMap? CategoryMap, 
             _matchedValues = matchedValues;
         }
 
-        // Step 1 aggregate the current expansion factors to the
-        ref var currentExpansionFactorsReference = ref MemoryMarshal.GetArrayDataReference(currentExpansionFactors);
-        ref var matchedValuesReference = ref MemoryMarshal.GetArrayDataReference(matchedValues);
-        ref var scratchReference = ref MemoryMarshal.GetArrayDataReference(scratch);
-        ref var expIndexesReference = ref MemoryMarshal.GetArrayDataReference(expIndexes);
-        ref var geographyIndexReference = ref MemoryMarshal.GetArrayDataReference(geographyIndex);
-        for (nuint i = 0; i < numberOfRecords; i++)
+        Array.Clear(actuals);
+        for (int i = 0; i < numberOfRecords; i++)
         {
-            // Match the records geography to the constraint's geography
-            var expansionIndex = Unsafe.Add(ref expIndexesReference, (nint)i);
-            var geographyIndexValue = Unsafe.Add(ref geographyIndexReference, (nint)i);
-            var recordExp = Unsafe.Add(ref currentExpansionFactorsReference, (nint)expansionIndex) *
-                Unsafe.Add(ref matchedValuesReference, (nint)i);
-
-            ref var scratchValue = ref Unsafe.Add(ref scratchReference, (nint)geographyIndexValue);
-            scratchValue += recordExp;
+            actuals[geographyIndex[i]] += expansionFactors[expIndexes[i]] * matchedValues[i];
         }
 
-        // Step 2 compare the results to the targets and compute how we need to reweight the expansion factors to meet the targets.
         var withinTolerance = true;
-        for (nuint i = 0; i < (nuint)Targets.Length; i++)
+        objective = 0.0;
+        var cellCount = Math.Max(1, totalConstraintCells);
+        for (int i = 0; i < Targets.Length; i++)
         {
-            float ratio;
-            if (Targets[i] > 0)
+            var target = Targets[i];
+            if (!float.IsFinite(target) || target < 0.0f)
             {
-                if (scratch[i] <= 0)
-                {
-                    // If the current expansion factor is zero, we cannot reweight it to meet the target.
-                    // This means that the constraint is not satisfied.
-                    var sparseGeography = (long)(CategoryMap?.Destination.GetSparseIndex((int)i) ?? (int)i);
-                    throw new XTMFRuntimeException(Module,
-                        $"Constraint {Name} is not satisfied because the current expansion factor for geography {sparseGeography} is zero. " +
-                        $"This means no survey records aggregate to target geography {sparseGeography} (of {Targets.Length} geographies). " +
-                        "If this happens on the first iteration, re-check the CategoryMap: its Base must be the TAZs and its Destination the constraint geography — a reversed or mismatched map will silently route records to the wrong geographies.");
-                }
-                ratio = Targets[i] / scratch[i];
-                scratch[i] = ratio;
+                throw new XTMFRuntimeException(Module, $"Constraint {Name} has a target that is not finite and nonnegative.");
             }
-            else
+
+            var actual = actuals[i];
+            var difference = actual - target;
+            var scale = Math.Max(Math.Abs((double)target), 1.0);
+            var scaledDifference = difference / scale;
+            objective += Weight * 0.5 * scaledDifference * scaledDifference / cellCount;
+            if (residualGradient is not null)
             {
-                ratio = scratch[i] <= 0 ? 1.0f : Targets[i] / scratch[i];
-                scratch[i] = ratio;
+                residualGradient[i] = Weight * difference / (scale * scale * cellCount);
             }
-            // Check to see if the constraint is satisfied within the tolerance
-            if (Math.Abs(ratio - 1.0f) > Tolerance)
+
+            if (Weight > 0.0f && target > 0.0f && actual <= 0.0)
             {
-                // If the ratio is not within the tolerance, the constraint is not satisfied.
+                var sparseGeography = (long)(CategoryMap?.Destination.GetSparseIndex(i) ?? i);
+                throw new XTMFRuntimeException(Module,
+                    $"Constraint {Name} is not satisfied because the current expansion factor for geography {sparseGeography} is zero. " +
+                    $"This means no survey records aggregate to target geography {sparseGeography} (of {Targets.Length} geographies). " +
+                    "If this happens on the first iteration, re-check the CategoryMap: its Base must be the TAZs and its Destination the constraint geography — a reversed or mismatched map will silently route records to the wrong geographies.");
+            }
+
+            var ratio = target == 0.0f
+                ? (actual <= 0.0 ? 1.0 : 0.0)
+                : target / actual;
+            if (Math.Abs(ratio - 1.0) > Tolerance)
+            {
                 withinTolerance = false;
             }
-            scratch[i] = MathF.Log(ratio);
         }
 
-        // Step 3 write the logarithm of the correction ratio to every matched household.
-        // Expansion factors are households, so all levels (household, person, trip) address the same array.
-        var recordCount = (int)numberOfRecords;
-        var chunkSize = Math.Max(1024, recordCount / (Environment.ProcessorCount * 4));
-        Parallel.ForEach(Partitioner.Create(0, recordCount, chunkSize), range =>
+        if (householdGradient is not null && residualGradient is not null)
         {
-            for (var i = range.Item1; i < range.Item2; i++)
+            for (int i = 0; i < numberOfRecords; i++)
             {
-                if (matchedValues[i] > 0)
-                {
-                    // At this point scratch contains the logarithm of the correction ratio for each geography.
-                    logRatios[expIndexes[i]] = scratch[geographyIndex[i]];
-                }
+                householdGradient[expIndexes[i]] += matchedValues[i] * residualGradient[geographyIndex[i]];
             }
-        });
+        }
 
         return withinTolerance;
+    }
+
+    internal double EvaluateConstraintObjective(
+        float[] data,
+        nuint numberOfAttributes,
+        float[] expansionFactors,
+        nuint[] expIndexes,
+        nuint[] geographyIndex,
+        double[] actuals,
+        int totalConstraintCells,
+        out bool withinTolerance)
+    {
+        withinTolerance = AccumulateObjectiveAndGradient(
+            data, numberOfAttributes, expansionFactors, expIndexes, geographyIndex,
+            actuals, null, null, totalConstraintCells, out var objective);
+        return objective;
     }
 }
 

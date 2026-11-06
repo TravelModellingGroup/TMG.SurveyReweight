@@ -84,15 +84,17 @@ column. Configure the zero-based key columns on the loader:
 
 | File | Required keys | Meaning |
 | --- | --- | --- |
-| Household | household ID, TAZ | One unique row per household |
+| Household | household ID, TAZ, initial expansion factor | One unique row per household |
 | Person | person ID, household ID | Each household ID must exist in the household file |
 | Trip | household ID, person ID | Each household and person ID must exist in the loaded records |
 
-All columns other than the configured keys become numeric survey attributes.
-For example, a household file might contain `household_id,taz,workers` and a
-person file might contain `person_id,household_id,age_group`. The attribute
-names are taken directly from the headers and are used when configuring
-constraints.
+Set `HouseholdExpansionFactorColumn` to the zero-based column containing the
+initial household expansion factors. These values must be finite, positive,
+and within the configured minimum and maximum expansion factors. The selected
+column is not treated as a constraint attribute. All other non-key columns
+become numeric survey attributes. For example, a household file might contain
+`household_id,taz,base_weight,workers`; configure `HouseholdExpansionFactorColumn`
+as `2`, and `workers` remains available as an attribute.
 
 ### Constraint target files
 
@@ -103,7 +105,10 @@ For every `LoadConstraint`, configure:
 	 person, or trip CSV headers.
 3. `GeographyColumn` and `TargetColumn`, as zero-based CSV column indexes.
 4. `Tolerance`, which defaults to `0.01`.
-5. An optional `CategoryMap` and constraint name.
+5. `ConstraintWeight`, which defaults to `1.0`; larger values give this
+   constraint more influence in the objective, while `0` excludes it from
+   optimization.
+6. An optional `CategoryMap` and constraint name.
 
 The geography column contains sparse TAZ or mapped geography indexes, and the
 target column contains the desired weighted total. A constraint with no
@@ -120,6 +125,16 @@ value per household, in the same household order as the input records.
 absolute difference, and ratio for every constraint geography plus a total
 row.
 
-`MaximumIterations` limits the calibration loop. `Damping` controls how much
-of each combined correction is applied per iteration: `1.0` applies the full
-correction, while smaller positive values make the updates more gradual.
+The calibration minimizes a weighted objective consisting of the
+`ConstraintWeight`-weighted mean squared scaled constraint errors plus
+`KLDivergencePenalty` times the generalized KL-divergence from the initial
+expansion factors, normalized by their total.
+For each constraint geography, the error is scaled by `max(abs(target), 1)`.
+The KL term is
+`sum(w * log(w / w0) - w + w0) / sum(w0)`, where `w0` is the input factor.
+Increasing `KLDivergencePenalty` favors staying closer to the input factors;
+decreasing it prioritizes fitting the constraints. The default is `1.0`.
+
+`MaximumIterations` limits objective-minimization iterations. `Damping` scales
+gradient steps relative to the configured expansion-factor range; a backtracking
+line search reduces the step when needed to ensure the objective decreases.
