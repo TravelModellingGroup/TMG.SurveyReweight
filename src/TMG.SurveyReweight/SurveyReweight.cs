@@ -1,5 +1,6 @@
 using XTMF2.RuntimeModules;
-using System.Collections.Concurrent;
+using System.Numerics;
+using TMG.Utilities;
 
 namespace TMG.SurveyReweight;
 
@@ -22,7 +23,7 @@ public class SurveyReweight : BaseAction
     [Parameter(Name = "MaximumIterations", DefaultValue = "100", Description = "The maximum number of iterations for the reweighting process.", Index = 3)]
     public IFunction<int> MaximumIterations = null!;
 
-    [Parameter(Name = "Damping", DefaultValue = "1.0", Description = "The damping applied to the combined constraint corrections. A value of one fully applies the corrections.", Index = 4)]
+    [Parameter(Name = "Damping", DefaultValue = "1.0", Description = "Scales gradient steps relative to the configured expansion factor range; backtracking reduces steps as needed.", Index = 4)]
     public IFunction<float> Damping = null!;
 
     [Parameter(Name = "MinimumExpansionFactor", DefaultValue = "1.0", Description = "The minimum allowed expansion factor during the reweighting process.", Index = 5)]
@@ -30,6 +31,9 @@ public class SurveyReweight : BaseAction
 
     [Parameter(Name = "MaximumExpansionFactor", DefaultValue = "50.0", Description = "The maximum allowed expansion factor during the reweighting process.", Index = 6)]
     public IFunction<float> MaximumExpansionFactor = null!;
+
+    [Parameter(Name = "KLDivergencePenalty", DefaultValue = "1.0", Description = "The relative weight of the KL-divergence penalty in the calibration objective.  A value of 1.0 indicates full weight, a value of 0 removes it.", Index = 10)]
+    public IFunction<float> KLDivergencePenalty = null!;
 
     [SubModule(Required = true, Name = "UpdatedExpansionFactorsFile", Description = "The CSV file to write the updated expansion factors to.", Index = 7)]
     public IFunction<WriteStream> UpdatedExpansionFactorsFile = null!;
@@ -55,15 +59,39 @@ public class SurveyReweight : BaseAction
         var maxIterations = MaximumIterations.Invoke();
         var damping = Damping.Invoke();
 
-
         // Step 4 initialize the expansion factors and temporary compute space for the reweighting process
         log?.Invoke($"Initializing expansion factors and temporary compute space...");
-        float[] currentExpansionFactors = new float[surveyRecords.NumberOfHouseholds];
-        currentExpansionFactors.AsSpan().Fill(1.0f);
+        if ((nuint)surveyRecords.InitialExpansionFactors.Length != surveyRecords.NumberOfHouseholds)
+        {
+            throw new XTMFRuntimeException(this,
+                $"The survey records contain {surveyRecords.InitialExpansionFactors.Length} initial expansion factors for {surveyRecords.NumberOfHouseholds} households.");
+        }
 
-        // Scratch is used for aggregating the current total of expansion factors for the currently weighted expansions.
-        // LogRatios is the logarithm of the correction each constraint wants applied to each household.
-        // The corrections are combined as a damped geometric mean before being applied to the expansion factors.
+        var minimumExpansionFactor = MinimumExpansionFactor.Invoke();
+        var maximumExpansionFactor = MaximumExpansionFactor.Invoke();
+        if (!float.IsFinite(minimumExpansionFactor) || !float.IsFinite(maximumExpansionFactor) ||
+            minimumExpansionFactor <= 0.0f || maximumExpansionFactor < minimumExpansionFactor)
+        {
+            throw new XTMFRuntimeException(this,
+                $"The configured expansion factor range [{minimumExpansionFactor}, {maximumExpansionFactor}] must be finite, positive, and ordered.");
+        }
+
+        for (int i = 0; i < surveyRecords.InitialExpansionFactors.Length; i++)
+        {
+            var expansionFactor = surveyRecords.InitialExpansionFactors[i];
+            if (!float.IsFinite(expansionFactor) || expansionFactor <= 0.0f)
+            {
+                throw new XTMFRuntimeException(this, $"The initial expansion factor for household {i} must be finite and greater than zero.");
+            }
+            if (expansionFactor < minimumExpansionFactor || expansionFactor > maximumExpansionFactor)
+            {
+                throw new XTMFRuntimeException(this,
+                    $"The initial expansion factor {expansionFactor} for household {i} is outside the configured range [{minimumExpansionFactor}, {maximumExpansionFactor}].");
+            }
+        }
+
+        float[] currentExpansionFactors = (float[])surveyRecords.InitialExpansionFactors.Clone();
+
         var householdCount = constraints.HouseholdConstraints.Length;
         var personCount = constraints.PersonConstraints.Length;
         var tripCount = constraints.TripConstraints.Length;
@@ -72,15 +100,21 @@ public class SurveyReweight : BaseAction
         int index = 0;
         foreach (var constraint in constraints.HouseholdConstraints)
         {
-            constraintData[index++] = new ConstraintData(this, constraint, (int)surveyRecords.NumberOfHouseholds, null);
+            constraintData[index++] = new ConstraintData(this, constraint,
+                surveyRecords.HouseholdData, surveyRecords.HouseholdAttributes.Length,
+                (int)surveyRecords.NumberOfHouseholds, null);
         }
         foreach (var constraint in constraints.PersonConstraints)
         {
-            constraintData[index++] = new ConstraintData(this, constraint, (int)surveyRecords.NumberOfPersons, surveyRecords.PersonHouseholdIndex);
+            constraintData[index++] = new ConstraintData(this, constraint,
+                surveyRecords.PersonData, surveyRecords.PersonAttributes.Length,
+                (int)surveyRecords.NumberOfPersons, surveyRecords.PersonHouseholdIndex);
         }
         foreach (var constraint in constraints.TripConstraints)
         {
-            constraintData[index++] = new ConstraintData(this, constraint, (int)surveyRecords.NumberOfTrips, surveyRecords.TripHouseholdIndex);
+            constraintData[index++] = new ConstraintData(this, constraint,
+                surveyRecords.TripData, surveyRecords.TripAttributes.Length,
+                (int)surveyRecords.NumberOfTrips, surveyRecords.TripHouseholdIndex);
         }
 
         // Initialize the geography index for each constraint.
@@ -98,91 +132,130 @@ public class SurveyReweight : BaseAction
         }
 
 
-        // Step 5 run the reweighting process
-        int iteration = 0;
-        for (; iteration < maxIterations; iteration++)
+        var klDivergencePenalty = KLDivergencePenalty.Invoke();
+        if (!float.IsFinite(damping) || damping <= 0.0f)
         {
-            log?.Invoke($"Running iteration {iteration + 1} of {maxIterations}...");
-            bool allConstraintsSatisfied = true;
+            throw new XTMFRuntimeException(this, "Damping must be finite and greater than zero.");
+        }
+        if (!float.IsFinite(klDivergencePenalty) || klDivergencePenalty < 0.0f)
+        {
+            throw new XTMFRuntimeException(this, "KLDivergencePenalty must be finite and greater than or equal to zero.");
+        }
 
-            Parallel.Invoke(() =>
+        var totalConstraintCells = constraintData.Sum(data => data.Constraint.Targets.Length);
+        var initialWeightTotal = surveyRecords.InitialExpansionFactors.Sum(weight => (double)weight);
+        var gradient = new double[currentExpansionFactors.Length];
+        var candidateExpansionFactors = new float[currentExpansionFactors.Length];
+        var gradientBufferCount = Math.Max(1, Math.Min(Environment.ProcessorCount, Math.Max(1, constraintData.Length)));
+        var gradientBuffers = new double[gradientBufferCount][];
+        for (int i = 0; i < gradientBuffers.Length; i++)
+        {
+            gradientBuffers[i] = new double[currentExpansionFactors.Length];
+        }
+
+        // Step 5 minimize relative constraint error plus the KL divergence from the initial weights.
+        var currentObjective = EvaluateObjective(
+            constraintData, currentExpansionFactors,
+            surveyRecords.InitialExpansionFactors, initialWeightTotal, totalConstraintCells,
+            klDivergencePenalty, gradient, gradientBuffers, out _);
+        if (!double.IsFinite(currentObjective))
+        {
+            throw new XTMFRuntimeException(this, "The initial calibration objective is not finite.");
+        }
+
+        var completedIterations = 0;
+        var converged = false;
+        var expansionFactorStepScale = Math.Max(1.0, maximumExpansionFactor - minimumExpansionFactor);
+        for (int iteration = 0; iteration < maxIterations; iteration++)
+        {
+            log?.Invoke($"Minimizing calibration objective in iteration {iteration + 1} of {maxIterations}...");
+            var maximumGradient = gradient.Length == 0 ? 0.0 : gradient.Max(value => Math.Abs(value));
+            if (maximumGradient == 0.0)
             {
-                Parallel.For(0, constraints.HouseholdConstraints.Length, i =>
-                {
-                    var data = constraintData[i];
-
-                    if (!constraints.HouseholdConstraints[i].UpdateConstraint(surveyRecords.HouseholdData, (nuint)surveyRecords.HouseholdAttributes.Length,
-                     currentExpansionFactors, data.Scratch, data.ExpansionIndex, data.GeographyIndex, data.LogRatios))
-                    {
-                        allConstraintsSatisfied = false;
-                    }
-                });
-            },
-            () =>
-            {
-                Parallel.For(0, constraints.PersonConstraints.Length, i =>
-                {
-                    var data = constraintData[householdCount + i];
-
-                    if (!constraints.PersonConstraints[i].UpdateConstraint(surveyRecords.PersonData, (nuint)surveyRecords.PersonAttributes.Length,
-                         currentExpansionFactors, data.Scratch, data.ExpansionIndex, data.GeographyIndex, data.LogRatios))
-                    {
-                        allConstraintsSatisfied = false;
-                    }
-                });
-            },
-            () =>
-            {
-                Parallel.For(0, constraints.TripConstraints.Length, i =>
-                {
-                    var data = constraintData[householdCount + personCount + i];
-
-                    if (!constraints.TripConstraints[i].UpdateConstraint(surveyRecords.TripData, (nuint)surveyRecords.TripAttributes.Length, currentExpansionFactors,
-                         data.Scratch, data.ExpansionIndex, data.GeographyIndex, data.LogRatios))
-                    {
-                        allConstraintsSatisfied = false;
-                    }
-                });
-            });
-
-            // Check if all of the constraints are satisfied
-            if (allConstraintsSatisfied)
-            {
+                converged = true;
                 break;
             }
 
-            // If we have not already found a sufficient solution, combine the corrections from every constraint.
-            // The correction for each household is the damped geometric mean of the per-constraint ratios:
-            //   W_hh *= exp(damping * sum(ln(ratio_i)) / count)
-            // where ratio_i is the correction the i-th constraint wants applied to that household (zero means the constraint does not affect it).
-            var householdCountForUpdate = currentExpansionFactors.Length;
-            var householdChunkSize = Math.Max(1024, householdCountForUpdate / (Environment.ProcessorCount * 4));
-            Parallel.ForEach(Partitioner.Create(0, householdCountForUpdate, householdChunkSize), range =>
+            var stepSize = (double)damping;
+            var accepted = false;
+            var convergedAtCurrentWeights = false;
+            double candidateObjective = currentObjective;
+            double maximumChange = 0.0;
+
+            for (int lineSearchIteration = 0; lineSearchIteration < 40; lineSearchIteration++)
             {
-                var minExpansionFactor = MinimumExpansionFactor.Invoke();
-                var maxExpansionFactor = MaximumExpansionFactor.Invoke();
-                for (var h = range.Item1; h < range.Item2; h++)
+                var gradientDotDirection = 0.0;
+                maximumChange = 0.0;
+                for (int h = 0; h < currentExpansionFactors.Length; h++)
                 {
-                    float totalLog = 0f;
-                    int count = 0;
-
-                    for (int i = 0; i < constraintData.Length; i++)
-                    {
-                        ref var logRatiosReference = ref MemoryMarshal.GetArrayDataReference(constraintData[i].LogRatios);
-                        var logRatio = Unsafe.Add(ref logRatiosReference, h);
-                        totalLog += logRatio;
-                        count += BoolToInt(logRatio != 0.0f);
-                    }
-
-                    if (count > 0)
-                    {
-                        currentExpansionFactors[h] *= MathF.Exp(damping * totalLog / count);
-                        currentExpansionFactors[h] = MathF.Max(minExpansionFactor, MathF.Min(maxExpansionFactor, currentExpansionFactors[h]));
-                    }
+                    var normalizedGradient = gradient[h] / maximumGradient;
+                    var proposed = currentExpansionFactors[h] -
+                        stepSize * expansionFactorStepScale * normalizedGradient;
+                    var bounded = Math.Clamp(proposed, minimumExpansionFactor, maximumExpansionFactor);
+                    candidateExpansionFactors[h] = (float)bounded;
+                    var direction = candidateExpansionFactors[h] - currentExpansionFactors[h];
+                    gradientDotDirection += gradient[h] * direction;
+                    maximumChange = Math.Max(maximumChange, Math.Abs(direction));
                 }
-            });
+
+                if (maximumChange == 0.0)
+                {
+                    convergedAtCurrentWeights = true;
+                    break;
+                }
+
+                candidateObjective = EvaluateObjective(
+                    constraintData, candidateExpansionFactors,
+                    surveyRecords.InitialExpansionFactors, initialWeightTotal, totalConstraintCells,
+                    klDivergencePenalty, null, gradientBuffers, out _);
+
+                if (double.IsFinite(candidateObjective) &&
+                    candidateObjective <= currentObjective + 1e-4 * gradientDotDirection)
+                {
+                    accepted = true;
+                    break;
+                }
+
+                stepSize *= 0.5;
+            }
+
+            if (convergedAtCurrentWeights)
+            {
+                converged = true;
+                break;
+            }
+            if (!accepted)
+            {
+                throw new XTMFRuntimeException(this,
+                    $"The calibration objective could not find a decreasing step after {completedIterations} iterations.");
+            }
+
+            Array.Copy(candidateExpansionFactors, currentExpansionFactors, currentExpansionFactors.Length);
+            var objectiveImprovement = currentObjective - candidateObjective;
+            currentObjective = candidateObjective;
+            completedIterations++;
+            EvaluateObjective(
+                constraintData, currentExpansionFactors,
+                surveyRecords.InitialExpansionFactors, initialWeightTotal, totalConstraintCells,
+                klDivergencePenalty, gradient, gradientBuffers, out _);
+
+            var maximumCurrentWeight = currentExpansionFactors.Length == 0
+                ? 1.0
+                : currentExpansionFactors.Max(weight => (double)weight);
+            if (maximumChange <= 1e-7 * Math.Max(1.0, maximumCurrentWeight) &&
+                objectiveImprovement <= 1e-10 * Math.Max(1.0, currentObjective))
+            {
+                converged = true;
+                break;
+            }
         }
-        log?.Invoke($"Reweighting process completed in {Math.Min(iteration + 1, maxIterations)} iterations of {maxIterations}.");
+
+        var finalObjective = EvaluateObjective(
+            constraintData, currentExpansionFactors,
+            surveyRecords.InitialExpansionFactors, initialWeightTotal, totalConstraintCells,
+            klDivergencePenalty, null, gradientBuffers, out var allConstraintsSatisfied);
+        log?.Invoke($"Calibration objective {finalObjective:G8} after {completedIterations} iterations of {maxIterations}; " +
+            $"all constraints within tolerance: {allConstraintsSatisfied}; converged: {converged}.");
 
         // Step 6 write out the final expansion factors to a CSV file
         log?.Invoke($"Writing out final expansion factors...");
@@ -203,13 +276,110 @@ public class SurveyReweight : BaseAction
         log?.Invoke($"Finished Reweighting");
     }
 
-    /// <summary>
-    /// Converts a boolean value to an integer (1 for true, 0 for false).
-    /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
-    private static int BoolToInt(bool condition)
+    private double EvaluateObjective(
+        ConstraintData[] constraintData,
+        float[] expansionFactors,
+        float[] initialExpansionFactors,
+        double initialWeightTotal,
+        int totalConstraintCells,
+        double klDivergencePenalty,
+        double[]? householdGradient,
+        double[][] gradientBuffers,
+        out bool allConstraintsSatisfied)
     {
-        return (int)Unsafe.As<bool, byte>(ref condition);
+        if (householdGradient is not null)
+        {
+            Array.Clear(householdGradient);
+        }
+
+        allConstraintsSatisfied = true;
+        var objective = 0.0;
+        // Fixed batch slots let constraints run concurrently while keeping the reduction order deterministic.
+        for (int batchStart = 0; batchStart < constraintData.Length; batchStart += gradientBuffers.Length)
+        {
+            var batchCount = Math.Min(gradientBuffers.Length, constraintData.Length - batchStart);
+            Parallel.For(0, batchCount, slot =>
+            {
+                var data = constraintData[batchStart + slot];
+                if (householdGradient is null)
+                {
+                    data.Objective = data.Constraint.EvaluateConstraintObjective(
+                        data.RecordData, data.NumberOfAttributes, expansionFactors,
+                        data.ExpansionIndex, data.GeographyIndex, data.Actuals,
+                        totalConstraintCells, out var withinTolerance);
+                    data.WithinTolerance = withinTolerance;
+                }
+                else
+                {
+                    var constraintGradient = gradientBuffers[slot];
+                    Array.Clear(constraintGradient);
+                    data.WithinTolerance = data.Constraint.AccumulateObjectiveAndGradient(
+                        data.RecordData, data.NumberOfAttributes, expansionFactors,
+                        data.ExpansionIndex, data.GeographyIndex, data.Actuals,
+                        data.ResidualGradient, constraintGradient,
+                        totalConstraintCells, out var constraintObjective);
+                    data.Objective = constraintObjective;
+                }
+            });
+
+            for (int slot = 0; slot < batchCount; slot++)
+            {
+                var data = constraintData[batchStart + slot];
+                objective += data.Objective;
+                allConstraintsSatisfied &= data.WithinTolerance;
+                if (householdGradient is not null)
+                {
+                    AddGradient(householdGradient, gradientBuffers[slot]);
+                }
+            }
+        }
+
+        var divergence = 0.0;
+        var divergenceScale = Math.Max(initialWeightTotal, double.Epsilon);
+        var factor = klDivergencePenalty / divergenceScale;
+        for (int h = 0; h < expansionFactors.Length; h++)
+        {
+            var logRatio = Math.Log(expansionFactors[h] / initialExpansionFactors[h]);
+            var weight = expansionFactors[h];
+            var initialWeight = initialExpansionFactors[h];
+            var term = weight * logRatio - weight + initialWeight;
+            divergence += Math.Max(0.0, term);
+        }
+
+        objective += klDivergencePenalty * divergence / divergenceScale;
+        if (householdGradient is not null)
+        {
+            Parallel.For(0, expansionFactors.Length, h =>
+            {
+                var logRatio = Math.Log(expansionFactors[h] / initialExpansionFactors[h]);
+                householdGradient[h] += factor * logRatio;
+            });
+        }
+
+        if (!double.IsFinite(objective) ||
+            (householdGradient is not null && householdGradient.Any(value => !double.IsFinite(value))))
+        {
+            throw new XTMFRuntimeException(this, "The calibration objective or its gradient is not finite.");
+        }
+
+        return objective;
+    }
+
+    private static void AddGradient(double[] gradient, double[] constraintGradient)
+    {
+        var index = 0;
+        var vectorWidth = Vector<double>.Count;
+        for (; index <= gradient.Length - vectorWidth; index += vectorWidth)
+        {
+            var gradientVector = new Vector<double>(gradient, index);
+            var constraintVector = new Vector<double>(constraintGradient, index);
+            (gradientVector + constraintVector).CopyTo(gradient, index);
+        }
+
+        for (; index < gradient.Length; index++)
+        {
+            gradient[index] += constraintGradient[index];
+        }
     }
 
     private void WriteConstraintReport(
@@ -279,23 +449,24 @@ public class SurveyReweight : BaseAction
 
 }
 
-/// <summary>
-/// Computes the per-constraint corrections (log-ratios) for each household using the expansion factors and survey records.
-/// </summary>
-/// <param name="module">The module that is calling this method</param>
-/// <param name="constraints">The constraints to be computed.</param>
-/// <param name="surveyRecords">The survey records to use for the computation.</param>
-/// <param name="currentExpansionFactors">The current expansion factors</param>
-/// <param name="logRatios">The resulting log-ratios for each household.</param>
 internal sealed class ConstraintData
 {
     private readonly IModule _module;
 
-    public ConstraintData(IModule module, Constraint constraint, int recordCount, nuint[]? expansionIndex)
+    public ConstraintData(
+        IModule module,
+        Constraint constraint,
+        float[] recordData,
+        int numberOfAttributes,
+        int recordCount,
+        nuint[]? expansionIndex)
     {
         _module = module;
         Constraint = constraint;
-        Scratch = new float[constraint.Targets.Length];
+        RecordData = recordData;
+        NumberOfAttributes = (nuint)numberOfAttributes;
+        Actuals = new double[constraint.Targets.Length];
+        ResidualGradient = new double[constraint.Targets.Length];
         GeographyIndex = new nuint[recordCount];
 
         if (expansionIndex is null)
@@ -307,14 +478,21 @@ internal sealed class ConstraintData
             }
         }
         ExpansionIndex = expansionIndex;
-        LogRatios = new float[ExpansionIndex.Length];
     }
 
     public Constraint Constraint { get; }
 
-    public float[] Scratch { get; }
+    public float[] RecordData { get; }
 
-    public float[] LogRatios { get; }
+    public nuint NumberOfAttributes { get; }
+
+    public double[] Actuals { get; }
+
+    public double[] ResidualGradient { get; }
+
+    public double Objective { get; set; }
+
+    public bool WithinTolerance { get; set; }
 
     public nuint[] ExpansionIndex { get; }
 

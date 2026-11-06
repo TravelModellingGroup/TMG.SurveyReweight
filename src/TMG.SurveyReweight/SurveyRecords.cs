@@ -16,6 +16,11 @@ public sealed class SurveyRecords
     /// </summary>
     public float[] HouseholdData { get; init; } = [];
 
+    /// <summary>
+    /// The initial expansion factor for each household, in household row order.
+    /// </summary>
+    public float[] InitialExpansionFactors { get; init; } = [];
+
     public required RecordAttribute[] PersonAttributes { get; init; } = [];
 
     /// <summary>
@@ -92,10 +97,14 @@ public sealed class LoadSurveyRecords : BaseFunction<ZoneSystem, SurveyRecords>
     [Parameter(DefaultValue = "1", Name = "TripPersonColumn", Index = 8, Description = "The zero-based trip CSV column containing the person identifier.")]
     public IFunction<int> TripPersonColumn = null!;
 
+    [Parameter(Name = "HouseholdExpansionFactorColumn", Index = 9, Description = "The zero-based household CSV column containing each household's initial expansion factor.")]
+    public IFunction<int> HouseholdExpansionFactorColumn = null!;
+
     public override SurveyRecords Invoke(ZoneSystem context)
     {
         var householdIDColumn = HouseholdIDColumn.Invoke();
         var householdTAZColumn = HouseholdTAZColumn.Invoke();
+        var householdExpansionFactorColumn = HouseholdExpansionFactorColumn.Invoke();
         var personIDColumn = PersonIDColumn.Invoke();
         var personHouseholdColumn = PersonHouseholdColumn.Invoke();
         var tripHouseholdColumn = TripHouseholdColumn.Invoke();
@@ -105,23 +114,29 @@ public sealed class LoadSurveyRecords : BaseFunction<ZoneSystem, SurveyRecords>
             HouseholdFile.Invoke(),
             "household",
             [householdIDColumn, householdTAZColumn],
+            householdExpansionFactorColumn,
             out var householdAttributes,
             out var householdData,
-            out var householdKeys);
+            out var householdKeys,
+            out var initialExpansionFactors);
         LoadTable(
             PersonFile.Invoke(),
             "person",
             [personIDColumn, personHouseholdColumn],
+            null,
             out var personAttributes,
             out var personData,
-            out var personKeys);
+            out var personKeys,
+            out _);
         LoadTable(
             TripFile.Invoke(),
             "trip",
             [tripHouseholdColumn, tripPersonColumn],
+            null,
             out var tripAttributes,
             out var tripData,
-            out var tripKeys);
+            out var tripKeys,
+            out _);
 
         var householdCount = (nuint)householdKeys.Length;
         var householdIDs = CreateUniqueIndex(householdKeys, 0, "household");
@@ -152,6 +167,7 @@ public sealed class LoadSurveyRecords : BaseFunction<ZoneSystem, SurveyRecords>
             HouseholdAttributes = householdAttributes,
             HouseholdTAZ = householdTAZ,
             HouseholdData = householdData,
+            InitialExpansionFactors = initialExpansionFactors,
             PersonAttributes = personAttributes,
             PersonData = personData,
             PersonHouseholdIndex = personHouseholdIndex,
@@ -169,9 +185,11 @@ public sealed class LoadSurveyRecords : BaseFunction<ZoneSystem, SurveyRecords>
         ReadStream stream,
         string level,
         int[] keyColumns,
+        int? additionalColumn,
         out RecordAttribute[] attributes,
         out float[] data,
-        out int[][] keys)
+        out int[][] keys,
+        out float[] additionalColumnData)
     {
         if (keyColumns.Any(column => column < 0) || keyColumns.Distinct().Count() != keyColumns.Length)
         {
@@ -181,10 +199,23 @@ public sealed class LoadSurveyRecords : BaseFunction<ZoneSystem, SurveyRecords>
         var attributeList = new List<RecordAttribute>();
         var dataList = new List<float>();
         var keyList = new List<int[]>();
+        var additionalColumnDataList = new List<float>();
 
         using var reader = new CsvReader(stream, true);
         var headers = reader.Headers;
         var keySet = keyColumns.ToHashSet();
+        if (additionalColumn is int column)
+        {
+            if (column < 0 || column >= headers.Length)
+            {
+                throw new XTMFRuntimeException(this, $"The {level} column index {column} is outside the available range of 0 to {headers.Length - 1}.");
+            }
+            if (!keySet.Add(column))
+            {
+                throw new XTMFRuntimeException(this, $"The {level} column index {column} cannot be used as both a key and an additional value.");
+            }
+        }
+
         for (int i = 0; i < headers.Length; i++)
         {
             if (!keySet.Contains(i))
@@ -210,6 +241,16 @@ public sealed class LoadSurveyRecords : BaseFunction<ZoneSystem, SurveyRecords>
                 }
                 keyList.Add(rowKeys);
 
+                if (additionalColumn is int additionalColumnIndex)
+                {
+                    reader.Get(out float value, additionalColumnIndex);
+                    if (!float.IsFinite(value) || value <= 0.0f)
+                    {
+                        throw new XTMFRuntimeException(this, $"The {level} value in column {additionalColumnIndex} must be finite and greater than zero on line {reader.LineNumber} of {reader.FileName}.");
+                    }
+                    additionalColumnDataList.Add(value);
+                }
+
                 for (int i = 0; i < headers.Length; i++)
                 {
                     if (!keySet.Contains(i))
@@ -232,6 +273,7 @@ public sealed class LoadSurveyRecords : BaseFunction<ZoneSystem, SurveyRecords>
         attributes = attributeList.ToArray();
         data = dataList.ToArray();
         keys = keyList.ToArray();
+        additionalColumnData = additionalColumnDataList.ToArray();
     }
 
     private Dictionary<int, nuint> CreateUniqueIndex(int[][] keys, int keyPosition, string level)
