@@ -130,6 +130,10 @@ public class SurveyReweight : BaseAction
         {
             constraintData[householdCount + personCount + i].InitializeGeographyIndexes(constraintData[householdCount + personCount + i].Constraint.CategoryMap, j => surveyRecords.HouseholdTAZ[surveyRecords.TripHouseholdIndex[j]]);
         }
+        foreach (var data in constraintData)
+        {
+            data.InitializeSparseContributions(currentExpansionFactors.Length);
+        }
 
 
         var klDivergencePenalty = KLDivergencePenalty.Invoke();
@@ -145,19 +149,14 @@ public class SurveyReweight : BaseAction
         var totalConstraintCells = constraintData.Sum(data => data.Constraint.Targets.Length);
         var initialWeightTotal = surveyRecords.InitialExpansionFactors.Sum(weight => (double)weight);
         var gradient = new double[currentExpansionFactors.Length];
+        var constraintGradient = new double[currentExpansionFactors.Length];
         var candidateExpansionFactors = new float[currentExpansionFactors.Length];
-        var gradientBufferCount = Math.Max(1, Math.Min(Environment.ProcessorCount, Math.Max(1, constraintData.Length)));
-        var gradientBuffers = new double[gradientBufferCount][];
-        for (int i = 0; i < gradientBuffers.Length; i++)
-        {
-            gradientBuffers[i] = new double[currentExpansionFactors.Length];
-        }
 
         // Step 5 minimize relative constraint error plus the KL divergence from the initial weights.
         var currentObjective = EvaluateObjective(
             constraintData, currentExpansionFactors,
             surveyRecords.InitialExpansionFactors, initialWeightTotal, totalConstraintCells,
-            klDivergencePenalty, gradient, gradientBuffers, out _);
+            klDivergencePenalty, gradient, constraintGradient, out _);
         if (!double.IsFinite(currentObjective))
         {
             throw new XTMFRuntimeException(this, "The initial calibration objective is not finite.");
@@ -166,6 +165,7 @@ public class SurveyReweight : BaseAction
         var completedIterations = 0;
         var converged = false;
         var expansionFactorStepScale = Math.Max(1.0, maximumExpansionFactor - minimumExpansionFactor);
+        var stepSize = (double)damping;
         for (int iteration = 0; iteration < maxIterations; iteration++)
         {
             log?.Invoke($"Minimizing calibration objective in iteration {iteration + 1} of {maxIterations}...");
@@ -176,7 +176,6 @@ public class SurveyReweight : BaseAction
                 break;
             }
 
-            var stepSize = (double)damping;
             var accepted = false;
             var convergedAtCurrentWeights = false;
             double candidateObjective = currentObjective;
@@ -207,7 +206,7 @@ public class SurveyReweight : BaseAction
                 candidateObjective = EvaluateObjective(
                     constraintData, candidateExpansionFactors,
                     surveyRecords.InitialExpansionFactors, initialWeightTotal, totalConstraintCells,
-                    klDivergencePenalty, null, gradientBuffers, out _);
+                    klDivergencePenalty, null, constraintGradient, out _);
 
                 if (double.IsFinite(candidateObjective) &&
                     candidateObjective <= currentObjective + 1e-4 * gradientDotDirection)
@@ -237,7 +236,7 @@ public class SurveyReweight : BaseAction
             EvaluateObjective(
                 constraintData, currentExpansionFactors,
                 surveyRecords.InitialExpansionFactors, initialWeightTotal, totalConstraintCells,
-                klDivergencePenalty, gradient, gradientBuffers, out _);
+                klDivergencePenalty, gradient, constraintGradient, out _);
 
             var maximumCurrentWeight = currentExpansionFactors.Length == 0
                 ? 1.0
@@ -253,7 +252,7 @@ public class SurveyReweight : BaseAction
         var finalObjective = EvaluateObjective(
             constraintData, currentExpansionFactors,
             surveyRecords.InitialExpansionFactors, initialWeightTotal, totalConstraintCells,
-            klDivergencePenalty, null, gradientBuffers, out var allConstraintsSatisfied);
+            klDivergencePenalty, null, constraintGradient, out var allConstraintsSatisfied);
         log?.Invoke($"Calibration objective {finalObjective:G8} after {completedIterations} iterations of {maxIterations}; " +
             $"all constraints within tolerance: {allConstraintsSatisfied}; converged: {converged}.");
 
@@ -284,7 +283,7 @@ public class SurveyReweight : BaseAction
         int totalConstraintCells,
         double klDivergencePenalty,
         double[]? householdGradient,
-        double[][] gradientBuffers,
+        double[] constraintGradient,
         out bool allConstraintsSatisfied)
     {
         if (householdGradient is not null)
@@ -294,44 +293,28 @@ public class SurveyReweight : BaseAction
 
         allConstraintsSatisfied = true;
         var objective = 0.0;
-        // Fixed batch slots let constraints run concurrently while keeping the reduction order deterministic.
-        for (int batchStart = 0; batchStart < constraintData.Length; batchStart += gradientBuffers.Length)
+        foreach (var data in constraintData)
         {
-            var batchCount = Math.Min(gradientBuffers.Length, constraintData.Length - batchStart);
-            Parallel.For(0, batchCount, slot =>
+            if (householdGradient is null)
             {
-                var data = constraintData[batchStart + slot];
-                if (householdGradient is null)
-                {
-                    data.Objective = data.Constraint.EvaluateConstraintObjective(
-                        data.RecordData, data.NumberOfAttributes, expansionFactors,
-                        data.ExpansionIndex, data.GeographyIndex, data.Actuals,
-                        totalConstraintCells, out var withinTolerance);
-                    data.WithinTolerance = withinTolerance;
-                }
-                else
-                {
-                    var constraintGradient = gradientBuffers[slot];
-                    Array.Clear(constraintGradient);
-                    data.WithinTolerance = data.Constraint.AccumulateObjectiveAndGradient(
-                        data.RecordData, data.NumberOfAttributes, expansionFactors,
-                        data.ExpansionIndex, data.GeographyIndex, data.Actuals,
-                        data.ResidualGradient, constraintGradient,
-                        totalConstraintCells, out var constraintObjective);
-                    data.Objective = constraintObjective;
-                }
-            });
-
-            for (int slot = 0; slot < batchCount; slot++)
-            {
-                var data = constraintData[batchStart + slot];
-                objective += data.Objective;
-                allConstraintsSatisfied &= data.WithinTolerance;
-                if (householdGradient is not null)
-                {
-                    AddGradient(householdGradient, gradientBuffers[slot]);
-                }
+                data.Objective = data.Constraint.EvaluateConstraintObjective(
+                    data.Contributions, expansionFactors, data.Actuals,
+                    totalConstraintCells, out var withinTolerance);
+                data.WithinTolerance = withinTolerance;
             }
+            else
+            {
+                Array.Clear(constraintGradient);
+                data.WithinTolerance = data.Constraint.AccumulateObjectiveAndGradient(
+                    data.Contributions, expansionFactors, data.Actuals,
+                    data.ResidualGradient, constraintGradient,
+                    totalConstraintCells, out var constraintObjective);
+                data.Objective = constraintObjective;
+                AddGradient(householdGradient, constraintGradient);
+            }
+
+            objective += data.Objective;
+            allConstraintsSatisfied &= data.WithinTolerance;
         }
 
         var divergence = 0.0;
@@ -497,6 +480,14 @@ internal sealed class ConstraintData
     public nuint[] ExpansionIndex { get; }
 
     public nuint[] GeographyIndex { get; }
+
+    public ConstraintContributions Contributions { get; private set; } = null!;
+
+    public void InitializeSparseContributions(int householdCount)
+    {
+        Contributions = Constraint.CreateContributions(
+            RecordData, NumberOfAttributes, ExpansionIndex, GeographyIndex, householdCount);
+    }
 
     public void InitializeGeographyIndexes(CategoryMap? map, Func<nuint, CategoryIndex> getRecordTAZ)
     {
