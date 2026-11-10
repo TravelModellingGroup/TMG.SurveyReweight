@@ -194,7 +194,7 @@ public record Constraint(
 {
 
     nuint[] _matchedIndexes = [.. MatchingAttributes.Select(a => (nuint)a.Index)];
-    float[]? _matchedValues;
+    private const int ParallelWorkThreshold = 128;
 
     internal float[] Aggregate(float[] data, int numberOfAttributes, float[] currentExpansionFactors, nuint[] expIndexes, nuint[] geographyIndex)
     {
@@ -212,44 +212,139 @@ public record Constraint(
         return actuals;
     }
 
-    internal bool AccumulateObjectiveAndGradient(
+    internal ConstraintContributions CreateContributions(
         float[] data,
         nuint numberOfAttributes,
-        float[] expansionFactors,
         nuint[] expIndexes,
         nuint[] geographyIndex,
+        int householdCount)
+    {
+        var matchedValues = new float[expIndexes.Length];
+        Parallel.For(0, expIndexes.Length, i =>
+        {
+            var matchedValue = 1.0f;
+            for (nuint j = 0; j < (nuint)_matchedIndexes.Length; j++)
+            {
+                matchedValue *= data[(nuint)i * numberOfAttributes + _matchedIndexes[j]];
+            }
+            matchedValues[i] = matchedValue;
+        });
+
+        var recordContributions = new List<RecordContribution>(expIndexes.Length);
+        for (int i = 0; i < expIndexes.Length; i++)
+        {
+            if (matchedValues[i] != 0.0f)
+            {
+                recordContributions.Add(new RecordContribution(
+                    (int)geographyIndex[i], (int)expIndexes[i], i, matchedValues[i]));
+            }
+        }
+
+        recordContributions.Sort(static (left, right) =>
+        {
+            var result = left.GeographyIndex.CompareTo(right.GeographyIndex);
+            if (result == 0)
+            {
+                result = left.HouseholdIndex.CompareTo(right.HouseholdIndex);
+            }
+            return result == 0 ? left.RecordIndex.CompareTo(right.RecordIndex) : result;
+        });
+
+        var pairContributions = new List<PairContribution>(recordContributions.Count);
+        for (int start = 0; start < recordContributions.Count;)
+        {
+            var first = recordContributions[start];
+            var value = 0.0;
+            var next = start;
+            while (next < recordContributions.Count &&
+                   recordContributions[next].GeographyIndex == first.GeographyIndex &&
+                   recordContributions[next].HouseholdIndex == first.HouseholdIndex)
+            {
+                value += recordContributions[next].Value;
+                next++;
+            }
+
+            if (value != 0.0)
+            {
+                pairContributions.Add(new PairContribution(first.GeographyIndex, first.HouseholdIndex, value));
+            }
+            start = next;
+        }
+
+        var pairGeographies = new int[pairContributions.Count];
+        var pairHouseholds = new int[pairContributions.Count];
+        var pairValues = new double[pairContributions.Count];
+        var geographyOffsets = new int[Targets.Length + 1];
+        var householdOffsets = new int[householdCount + 1];
+        for (int i = 0; i < pairContributions.Count; i++)
+        {
+            var pair = pairContributions[i];
+            pairGeographies[i] = pair.GeographyIndex;
+            pairHouseholds[i] = pair.HouseholdIndex;
+            pairValues[i] = pair.Value;
+            geographyOffsets[pair.GeographyIndex + 1]++;
+            householdOffsets[pair.HouseholdIndex + 1]++;
+        }
+
+        for (int i = 1; i < geographyOffsets.Length; i++)
+        {
+            geographyOffsets[i] += geographyOffsets[i - 1];
+        }
+        for (int i = 1; i < householdOffsets.Length; i++)
+        {
+            householdOffsets[i] += householdOffsets[i - 1];
+        }
+
+        var householdPairIndexes = Enumerable.Range(0, pairContributions.Count).ToArray();
+        Array.Sort(householdPairIndexes, (left, right) =>
+        {
+            var result = pairHouseholds[left].CompareTo(pairHouseholds[right]);
+            return result == 0
+                ? pairGeographies[left].CompareTo(pairGeographies[right])
+                : result;
+        });
+
+        return new ConstraintContributions(
+            geographyOffsets, householdOffsets, pairGeographies,
+            pairHouseholds, pairValues, householdPairIndexes);
+    }
+
+    internal bool AccumulateObjectiveAndGradient(
+        ConstraintContributions contributions,
+        float[] expansionFactors,
         double[] actuals,
         double[]? residualGradient,
         double[]? householdGradient,
         int totalConstraintCells,
         out double objective)
     {
-        var numberOfRecords = expIndexes.Length;
         if (!float.IsFinite(Weight) || Weight < 0.0f)
         {
             throw new XTMFRuntimeException(Module, $"Constraint {Name} has a weight that is not finite and nonnegative.");
         }
 
-        var matchedValues = _matchedValues;
-        if (matchedValues is null)
-        {
-            matchedValues = new float[numberOfRecords];
-            Parallel.For(0, numberOfRecords, i =>
-            {
-                var matchedValue = 1.0f;
-                for (nuint j = 0; j < (nuint)_matchedIndexes.Length; j++)
-                {
-                    matchedValue *= data[(nuint)i * numberOfAttributes + _matchedIndexes[j]];
-                }
-                matchedValues[i] = matchedValue;
-            });
-            _matchedValues = matchedValues;
-        }
-
         Array.Clear(actuals);
-        for (int i = 0; i < numberOfRecords; i++)
+        Action<int> aggregateGeography = geography =>
         {
-            actuals[geographyIndex[i]] += expansionFactors[expIndexes[i]] * matchedValues[i];
+            var actual = 0.0;
+            for (int i = contributions.GeographyOffsets[geography]; i < contributions.GeographyOffsets[geography + 1]; i++)
+            {
+                var pairIndex = i;
+                actual += expansionFactors[contributions.PairHouseholds[pairIndex]] *
+                    contributions.PairValues[pairIndex];
+            }
+            actuals[geography] = actual;
+        };
+        if (Targets.Length >= ParallelWorkThreshold)
+        {
+            Parallel.For(0, Targets.Length, aggregateGeography);
+        }
+        else
+        {
+            for (int geography = 0; geography < Targets.Length; geography++)
+            {
+                aggregateGeography(geography);
+            }
         }
 
         var withinTolerance = true;
@@ -293,9 +388,27 @@ public record Constraint(
 
         if (householdGradient is not null && residualGradient is not null)
         {
-            for (int i = 0; i < numberOfRecords; i++)
+            Action<int> aggregateHousehold = household =>
             {
-                householdGradient[expIndexes[i]] += matchedValues[i] * residualGradient[geographyIndex[i]];
+                var gradient = 0.0;
+                for (int i = contributions.HouseholdOffsets[household]; i < contributions.HouseholdOffsets[household + 1]; i++)
+                {
+                    var pairIndex = contributions.HouseholdPairIndexes[i];
+                    gradient += contributions.PairValues[pairIndex] *
+                        residualGradient[contributions.PairGeographies[pairIndex]];
+                }
+                householdGradient[household] = gradient;
+            };
+            if (householdGradient.Length >= ParallelWorkThreshold)
+            {
+                Parallel.For(0, householdGradient.Length, aggregateHousehold);
+            }
+            else
+            {
+                for (int household = 0; household < householdGradient.Length; household++)
+                {
+                    aggregateHousehold(household);
+                }
             }
         }
 
@@ -303,20 +416,42 @@ public record Constraint(
     }
 
     internal double EvaluateConstraintObjective(
-        float[] data,
-        nuint numberOfAttributes,
+        ConstraintContributions contributions,
         float[] expansionFactors,
-        nuint[] expIndexes,
-        nuint[] geographyIndex,
         double[] actuals,
         int totalConstraintCells,
         out bool withinTolerance)
     {
         withinTolerance = AccumulateObjectiveAndGradient(
-            data, numberOfAttributes, expansionFactors, expIndexes, geographyIndex,
-            actuals, null, null, totalConstraintCells, out var objective);
+            contributions, expansionFactors, actuals, null, null,
+            totalConstraintCells, out var objective);
         return objective;
     }
+
+    private readonly record struct RecordContribution(int GeographyIndex, int HouseholdIndex, int RecordIndex, double Value);
+
+    private readonly record struct PairContribution(int GeographyIndex, int HouseholdIndex, double Value);
+}
+
+internal sealed class ConstraintContributions(
+    int[] geographyOffsets,
+    int[] householdOffsets,
+    int[] pairGeographies,
+    int[] pairHouseholds,
+    double[] pairValues,
+    int[] householdPairIndexes)
+{
+    public int[] GeographyOffsets { get; } = geographyOffsets;
+
+    public int[] HouseholdOffsets { get; } = householdOffsets;
+
+    public int[] PairGeographies { get; } = pairGeographies;
+
+    public int[] PairHouseholds { get; } = pairHouseholds;
+
+    public double[] PairValues { get; } = pairValues;
+
+    public int[] HouseholdPairIndexes { get; } = householdPairIndexes;
 }
 
 /// <summary>
