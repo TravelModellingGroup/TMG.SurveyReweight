@@ -373,7 +373,7 @@ public class SurveyReweight : BaseAction
         float[] expansionFactors)
     {
         using var writer = new StreamWriter(stream);
-        writer.WriteLine("ConstraintType,Constraint,Geography,Target,Actual,AbsoluteDifference,Ratio");
+        writer.WriteLine("ConstraintType,Constraint,Geography,Index,Target,Actual,AbsoluteDifference,Ratio");
 
         WriteConstraintReports(writer, "Household", constraints.HouseholdConstraints, constraintData, 0,
             surveyRecords.HouseholdData, surveyRecords.HouseholdAttributes.Length, expansionFactors);
@@ -404,11 +404,13 @@ public class SurveyReweight : BaseAction
             for (int geography = 0; geography < constraint.Targets.Length; geography++)
             {
                 WriteConstraintReportRow(writer, constraintType, constraint.Name,
+                    constraint.GeographyName,
                     constraint.CategoryMap?.Destination.GetSparseIndex(geography) ?? geography,
                     constraint.Targets[geography], actuals[geography]);
             }
 
-            WriteConstraintReportRow(writer, constraintType, constraint.Name, new CategoryIndex(-1), targetTotal, actualTotal);
+            WriteConstraintReportRow(writer, constraintType, constraint.Name, constraint.GeographyName,
+                new CategoryIndex(-1), targetTotal, actualTotal);
         }
     }
 
@@ -416,13 +418,14 @@ public class SurveyReweight : BaseAction
         StreamWriter writer,
         string constraintType,
         string constraintName,
+        string geographyName,
         CategoryIndex geography,
         float target,
         float actual)
     {
         var difference = actual - target;
         var ratio = target == 0.0f ? 1.0f : actual / target;
-        writer.WriteLine($"{CsvEscape(constraintType)},{CsvEscape(constraintName)},{CsvEscape(geography.Exists ? ((long)(nint)geography).ToString() : "Global")},{target},{actual},{difference},{ratio}");
+        writer.WriteLine($"{CsvEscape(constraintType)},{CsvEscape(constraintName)},{CsvEscape(geographyName)},{CsvEscape(geography.Exists ? ((long)(nint)geography).ToString() : "Global")},{target},{actual},{difference},{ratio}");
     }
 
     private static string CsvEscape(string value)

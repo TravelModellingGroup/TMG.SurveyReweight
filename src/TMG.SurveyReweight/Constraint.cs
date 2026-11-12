@@ -129,7 +129,10 @@ public class LoadConstraint : BaseFunction<(ZoneSystem ZoneSystem, RecordAttribu
             throw new XTMFRuntimeException(this, $"Unable to read from {reader.FileName} on line {reader.LineNumber}: {exception.Message}");
         }
 
-        return new Constraint(this, constraintName, categoryMap, matchingAttributes, targets, Tolerance.Invoke(), constraintWeight);
+        return new Constraint(this, constraintName, categoryMap, matchingAttributes, targets, Tolerance.Invoke(), constraintWeight)
+        {
+            GeographyName = CategoryMap is null ? "TAZ" : CategoryMap.Name ?? "Unnamed Geography"
+        };
     }
 }
 
@@ -192,6 +195,7 @@ public record Constraint(
     float Tolerance,
     float Weight = 1.0f)
 {
+    public string GeographyName { get; init; } = "TAZ";
 
     nuint[] _matchedIndexes = [.. MatchingAttributes.Select(a => (nuint)a.Index)];
     private const int ParallelWorkThreshold = 128;
