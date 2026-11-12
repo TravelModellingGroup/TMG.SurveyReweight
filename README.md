@@ -121,9 +121,11 @@ trip attributes.
 
 `UpdatedExpansionFactorsFile` receives a CSV with one `UpdatedExpansionFactor`
 value per household, in the same household order as the input records.
-`ConstraintReportFile`, when connected, receives the target, final actual,
-absolute difference, and ratio for every constraint geography plus a total
-row.
+`ConstraintReportFile`, when connected, receives the constraint type and name,
+the geography name (the configured `CategoryMap` module name, or `TAZ` when no
+map is used), the sparse geography index, the target, final actual, absolute
+difference, and ratio for every constraint geography plus a total row. The
+total row uses `Global` in the `Index` column.
 
 The calibration minimizes a weighted objective consisting of the
 `ConstraintWeight`-weighted mean squared scaled constraint errors plus
